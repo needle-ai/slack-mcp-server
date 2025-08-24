@@ -1,17 +1,10 @@
-#!/usr/bin/env node
-
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { WebClient } from '@slack/web-api';
-import dotenv from 'dotenv';
-import express from 'express';
-import { randomUUID } from 'node:crypto';
 import {
   ListChannelsRequestSchema,
   PostMessageRequestSchema,
@@ -33,63 +26,7 @@ import {
   ConversationsRepliesResponseSchema,
 } from './schemas.js';
 
-dotenv.config();
-
-if (!process.env.SLACK_BOT_TOKEN) {
-  console.error(
-    'SLACK_BOT_TOKEN is not set. Please set it in your environment or .env file.'
-  );
-  process.exit(1);
-}
-
-if (!process.env.SLACK_USER_TOKEN) {
-  console.error(
-    'SLACK_USER_TOKEN is not set. Please set it in your environment or .env file.'
-  );
-  process.exit(1);
-}
-
-const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-const userClient = new WebClient(process.env.SLACK_USER_TOKEN);
-
-// Parse command line arguments
-function parseArguments() {
-  const args = process.argv.slice(2);
-  let port: number | undefined;
-
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '-port' && i + 1 < args.length) {
-      const portValue = parseInt(args[i + 1], 10);
-      if (isNaN(portValue) || portValue <= 0 || portValue > 65535) {
-        console.error(`Invalid port number: ${args[i + 1]}`);
-        process.exit(1);
-      }
-      port = portValue;
-      i++; // Skip the next argument since it's the port value
-    } else if (args[i] === '--help' || args[i] === '-h') {
-      console.log(`
-Usage: slack-mcp-server [options]
-
-Options:
-  -port <number>    Start the server with Streamable HTTP transport on the specified port
-  -h, --help        Show this help message
-
-Examples:
-  slack-mcp-server                  # Start with stdio transport (default)
-  slack-mcp-server -port 3000       # Start with Streamable HTTP transport on port 3000
-`);
-      process.exit(0);
-    } else if (args[i].startsWith('-')) {
-      console.error(`Unknown option: ${args[i]}`);
-      console.error('Use --help for usage information');
-      process.exit(1);
-    }
-  }
-
-  return { port };
-}
-
-function createServer(): Server {
+export function createServer(accessToken: string): Server {
   const server = new Server(
     {
       name: 'slack-mcp-server',
@@ -101,6 +38,8 @@ function createServer(): Server {
       },
     }
   );
+
+  const slackClient = new WebClient(accessToken);
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
@@ -379,7 +318,7 @@ function createServer(): Server {
           query = query.trim();
           console.log('Search query:', query);
 
-          const response = await userClient.search.messages({
+          const response = await slackClient.search.messages({
             query: query,
             highlight: parsedParams.highlight,
             sort: parsedParams.sort,
@@ -550,121 +489,3 @@ function createServer(): Server {
 
   return server;
 }
-
-async function runStdioServer() {
-  const server = createServer();
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error('Slack MCP Server running on stdio');
-}
-
-async function runHttpServer(port: number) {
-  const app = express();
-  app.use(express.json());
-
-  // Map to store transports by session ID
-  const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
-
-  // Handle POST requests for client-to-server communication
-  app.post('/mcp', async (req, res) => {
-    try {
-      // Check for existing session ID
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      let transport: StreamableHTTPServerTransport;
-
-      if (sessionId && transports[sessionId]) {
-        // Reuse existing transport
-        transport = transports[sessionId];
-      } else {
-        // Create new transport
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (newSessionId) => {
-            // Store the transport by session ID
-            transports[newSessionId] = transport;
-            console.error(`New MCP session initialized: ${newSessionId}`);
-          },
-        });
-
-        // Clean up transport when closed
-        transport.onclose = () => {
-          if (transport.sessionId) {
-            delete transports[transport.sessionId];
-            console.error(`MCP session closed: ${transport.sessionId}`);
-          }
-        };
-
-        const server = createServer();
-        await server.connect(transport);
-      }
-
-      // Handle the request
-      await transport.handleRequest(req, res, req.body);
-    } catch (error) {
-      console.error('Error handling MCP request:', error);
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: '2.0',
-          error: {
-            code: -32603,
-            message: 'Internal server error',
-          },
-          id: null,
-        });
-      }
-    }
-  });
-
-  // Handle GET requests for server-to-client notifications via SSE
-  app.get('/mcp', async (req, res) => {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (!sessionId || !transports[sessionId]) {
-      res.status(400).send('Invalid or missing session ID');
-      return;
-    }
-
-    const transport = transports[sessionId];
-    await transport.handleRequest(req, res);
-  });
-
-  // Handle DELETE requests for session termination
-  app.delete('/mcp', async (req, res) => {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (!sessionId || !transports[sessionId]) {
-      res.status(400).send('Invalid or missing session ID');
-      return;
-    }
-
-    const transport = transports[sessionId];
-    await transport.handleRequest(req, res);
-  });
-
-  // Health check endpoint
-  app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-  });
-
-  app.listen(port, () => {
-    console.error(
-      `Slack MCP Server running on Streamable HTTP at http://localhost:${port}/mcp`
-    );
-    console.error(`Health check available at http://localhost:${port}/health`);
-  });
-}
-
-async function main() {
-  const { port } = parseArguments();
-
-  if (port !== undefined) {
-    // Run with Streamable HTTP transport
-    await runHttpServer(port);
-  } else {
-    // Run with stdio transport (default)
-    await runStdioServer();
-  }
-}
-
-main().catch((error) => {
-  console.error('Fatal error in main():', error);
-  process.exit(1);
-});
